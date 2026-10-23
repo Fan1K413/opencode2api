@@ -944,6 +944,12 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			}
 			break
 		}
+		if resp.Header.Get(proxyCooldownHeader) == "true" {
+			resp.Header.Del(proxyCooldownHeader)
+			// No upstream attempt occurred: do not penalize a pooled key,
+			// retry, or refresh the global session while exits are cooling.
+			return resp.Body, resp.StatusCode, resp.Header, nil
+		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if pooled {
 				reportKeyResult(keyID, resp.StatusCode, nil)
@@ -1000,7 +1006,8 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		// 光换 sessionID 不够：上游限流按 sessionID+projectID 组合归因，
 		// projectID 不变则限流窗口仍在旧身份上。sessionRotated 标志保证
 		// 每次请求至多换代一次，避免无限重建。
-		rotateSessionOn429 := resp.StatusCode == http.StatusTooManyRequests &&
+		_, proxyPooled := client.Transport.(*proxyPoolTransport)
+		rotateSessionOn429 := !proxyPooled && resp.StatusCode == http.StatusTooManyRequests &&
 			!canRetry &&
 			!sessionRotated &&
 			!ocSessionClientSpecified
@@ -1027,6 +1034,12 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		lastErr = fmt.Errorf("upstream error")
 		if !canRetry {
 			break
+		}
+		if proxyPooled && resp.StatusCode == http.StatusTooManyRequests {
+			invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, ocSession)
+			client.CloseIdleConnections()
+			retryCount++
+			continue
 		}
 		// 429 重试退避：上游错误信息明确要求 "Please retry after a brief
 		// wait"，立即重发只会在同一限速窗口内反复撞限。Retry-After 优先

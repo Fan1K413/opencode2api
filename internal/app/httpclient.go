@@ -365,8 +365,8 @@ func stickyByBodyEnabled() bool {
 }
 
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
-func buildProxyClient(proxy Socks5Proxy) *http.Client {
-	return &http.Client{
+func buildProxyClient(proxy Socks5Proxy, pool bool) *http.Client {
+	client := &http.Client{
 		Timeout: 300 * time.Second,
 		Transport: &http.Transport{
 			DialContext: socks5Dial(proxy),
@@ -381,6 +381,10 @@ func buildProxyClient(proxy Socks5Proxy) *http.Client {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
+	if pool {
+		client.Transport = &proxyPoolTransport{addr: proxy.Addr, base: client.Transport}
+	}
+	return client
 }
 
 // selectUpstreamTarget 为一次上游请求选择 (baseURL, client)：
@@ -456,7 +460,7 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 		delete(stickyEntries, oldestKey)
 	}
 	if e, ok := stickyEntries[key]; ok {
-		if (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0) {
+		if (domainSticky && e.baseIdx < 0) || (proxySticky && (e.proxyIdx < 0 || e.proxyIdx >= nProxy || proxyCooldownRemaining(proxies[e.proxyIdx].Addr) > 0)) {
 			// 维度配置变化导致旧条目不满足当前需求，重建。
 			delete(stickyEntries, key)
 		} else {
@@ -481,12 +485,12 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 	}
 	proxyIdx := -1
 	if proxySticky {
-		proxyIdx = int(h % uint32(nProxy))
+		proxyIdx = availableProxyIndex(proxies, int(h%uint32(nProxy)))
 	}
 
 	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx, lastUsed: now}
 	if proxySticky {
-		entry.client = buildProxyClient(proxies[proxyIdx])
+		entry.client = buildProxyClient(proxies[proxyIdx], true)
 	} else {
 		entry.client = httpClient
 	}
@@ -535,7 +539,7 @@ func getHTTPClient() *http.Client {
 			return httpClient
 		}
 		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[idx]
+		proxy = socks5Proxies[availableProxyIndex(socks5Proxies, int(idx))]
 		useRR = true
 	} else {
 		if socks5Client != nil && socks5ClientAddr == activeSocks5 {
@@ -555,7 +559,7 @@ func getHTTPClient() *http.Client {
 		}
 	}
 
-	client := buildProxyClient(proxy)
+	client := buildProxyClient(proxy, useRR)
 
 	if !useRR {
 		socks5Client = client
