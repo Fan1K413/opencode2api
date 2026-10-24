@@ -208,6 +208,20 @@ var (
 	socks5Mu         sync.RWMutex
 )
 
+// proxiesEqual 深度比较两个代理列表（含凭证），用于判断配置热重载时代理配置
+// 是否真正发生变化，避免无关字段保存时误触发 sticky/连接池重置。
+func proxiesEqual(a, b []Socks5Proxy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Addr != b[i].Addr || a[i].Username != b[i].Username || a[i].Password != b[i].Password {
+			return false
+		}
+	}
+	return true
+}
+
 const socks5RR = "__round_robin__"
 
 var socks5RRIndex uint32
@@ -260,11 +274,11 @@ type stickyProxyEntry struct {
 	baseIdx  int // 上游域名下标（-1 表示未启用多域名 sticky）
 	proxyIdx int // 代理下标（-1 表示直连）
 	client   *http.Client
-	lastUsed time.Time
+	lastUsed atomic.Int64 // unix nano；读路径可无锁更新
 }
 
 var (
-	stickyMu      sync.Mutex
+	stickyMu      sync.RWMutex
 	stickyEntries = map[string]*stickyProxyEntry{}
 )
 
@@ -364,6 +378,78 @@ func stickyByBodyEnabled() bool {
 	return v != "0" && v != "false" && v != "no" && v != "off"
 }
 
+// ======================== 代理 Client 单例池 ========================
+//
+// 之前每次请求（轮询模式）或每个会话（sticky 模式）都 buildProxyClient 新建
+// http.Client + http.Transport，连接池配置形同虚设，且并发请求各自重建
+// TCP+SOCKS5+TLS 握手。改为按 proxy.Addr 缓存单例 Client，全局复用同一连接池。
+// 配置变更时由 resetProxyClientPool 清空并 CloseIdleConnections 旧实例。
+
+var (
+	proxyClientMu      sync.RWMutex
+	proxyClientPool    = map[string]*http.Client{} // key: proxyClientKey(proxy)
+	proxyClientBuilder = buildProxyClient
+)
+
+// proxyClientKey 生成代理单例池的键，包含 Addr 与凭证，避免同地址不同账号
+// 的代理共用同一 Client 导致认证串号。
+func proxyClientKey(proxy Socks5Proxy) string {
+	return proxy.Addr + "\x00" + proxy.Username + "\x00" + proxy.Password
+}
+
+// isTemplateProxy 报告代理凭证中是否含有模板变量（目前仅 {{session-id}}）。
+// 含模板的代理不进单例池，每次请求展开后独立构建 Client。
+func isTemplateProxy(proxy Socks5Proxy) bool {
+	return strings.Contains(proxy.Username, "{{session-id}}") ||
+		strings.Contains(proxy.Password, "{{session-id}}")
+}
+
+// expandProxyCredentials 将代理凭证中的模板变量替换为实际值。
+// ocScope 是 normalizedTransportScope(ocSessionID) 的哈希形式（16 hex chars），
+// 用于唯一标识会话出口，长度固定且已脱敏，适合直接嵌入用户名。
+func expandProxyCredentials(proxy Socks5Proxy, ocScope string) Socks5Proxy {
+	if ocScope == "" || !isTemplateProxy(proxy) {
+		return proxy
+	}
+	proxy.Username = strings.ReplaceAll(proxy.Username, "{{session-id}}", ocScope)
+	proxy.Password = strings.ReplaceAll(proxy.Password, "{{session-id}}", ocScope)
+	return proxy
+}
+
+// getOrBuildProxyClient 返回 proxy 对应的单例 HTTP 客户端，不存在则构建。
+// 模板代理（含 {{session-id}}）不进单例池，由调用方负责传入已展开凭证的 proxy。
+func getOrBuildProxyClient(proxy Socks5Proxy, pool bool) *http.Client {
+	k := fmt.Sprintf("%t\x00%s", pool, proxyClientKey(proxy))
+	proxyClientMu.RLock()
+	if c, ok := proxyClientPool[k]; ok {
+		proxyClientMu.RUnlock()
+		return c
+	}
+	proxyClientMu.RUnlock()
+
+	proxyClientMu.Lock()
+	defer proxyClientMu.Unlock()
+	// 双重检查
+	if c, ok := proxyClientPool[k]; ok {
+		return c
+	}
+	c := proxyClientBuilder(proxy, pool)
+	proxyClientPool[k] = c
+	return c
+}
+
+// resetProxyClientPool 清空代理 Client 单例池并关闭旧实例的空闲连接。
+// 在代理配置（socks5Proxies / activeSocks5）变更时调用，避免残留指向已删除
+// 代理的连接池。sticky 条目由调用方另行清空。
+func resetProxyClientPool() {
+	proxyClientMu.Lock()
+	defer proxyClientMu.Unlock()
+	for addr, c := range proxyClientPool {
+		c.CloseIdleConnections()
+		delete(proxyClientPool, addr)
+	}
+}
+
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
 func buildProxyClient(proxy Socks5Proxy, pool bool) *http.Client {
 	client := &http.Client{
@@ -419,7 +505,7 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 		return baseURLs[0], getHTTPClient()
 	}
 
-	entry := lookupOrCreateSticky(key, domainSticky, proxySticky, len(baseURLs), len(proxies), proxies)
+	entry := lookupOrCreateSticky(key, domainSticky, proxySticky, len(baseURLs), len(proxies), proxies, ocScope)
 	base := baseURLs[0]
 	if entry.baseIdx >= 0 {
 		base = baseURLs[entry.baseIdx]
@@ -431,47 +517,70 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 		}
 		return base, getHTTPClient()
 	}
+	// 模板代理：client 字段为 nil，每次请求按 ocScope 展开凭证后新建（不池化）。
+	if entry.client == nil && entry.proxyIdx >= 0 && entry.proxyIdx < len(proxies) {
+		expanded := expandProxyCredentials(proxies[entry.proxyIdx], ocScope)
+		return base, buildProxyClient(expanded, true)
+	}
 	return base, entry.client
 }
 
 // lookupOrCreateSticky 查找或创建会话的 (域名, 代理) 绑定。同一 key 的连续
 // 绑定因 stickyRebindSeq 递增而轮换，使失效后的重绑真正换到不同目标。
 // proxySticky=false 时只缓存域名维（baseIdx），client 字段不使用。
-func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy) *stickyProxyEntry {
-	stickyMu.Lock()
-	defer stickyMu.Unlock()
-	now := time.Now()
-	// 懒清理：先清过期条目，超出上限时再清最旧的。
-	if len(stickyEntries) > stickyMaxEntries || len(stickyEntries) > 0 {
-		for k, e := range stickyEntries {
-			if now.Sub(e.lastUsed) > stickyEntryTTL {
-				delete(stickyEntries, k)
-			}
-		}
-	}
-	if len(stickyEntries) > stickyMaxEntries {
-		var oldestKey string
-		var oldest time.Time
-		for k, e := range stickyEntries {
-			if oldestKey == "" || e.lastUsed.Before(oldest) {
-				oldestKey, oldest = k, e.lastUsed
-			}
-		}
-		delete(stickyEntries, oldestKey)
-	}
+// 模板代理（含 {{session-id}}）不在 entry 中缓存 client，由调用方按 ocScope
+// 展开凭证后直接构建，避免每会话独立 Transport 无限增长。
+func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy, _ string) *stickyProxyEntry {
+	nowNano := time.Now().UnixNano()
+	ttlNano := stickyEntryTTL.Nanoseconds()
+
+	// 快路径：持读锁检查已有条目，命中时仅原子更新 lastUsed。
+	// 若条目已过期则直接落入慢路径重建，不刷新 lastUsed。
+	stickyMu.RLock()
 	if e, ok := stickyEntries[key]; ok {
-		if (domainSticky && e.baseIdx < 0) || (proxySticky && (e.proxyIdx < 0 || e.proxyIdx >= nProxy || proxyCooldownRemaining(proxies[e.proxyIdx].Addr) > 0)) {
-			// 维度配置变化导致旧条目不满足当前需求，重建。
-			delete(stickyEntries, key)
-		} else {
-			e.lastUsed = now
+		needRebuild := (domainSticky && e.baseIdx < 0) || (proxySticky && (e.proxyIdx < 0 || e.proxyIdx >= nProxy || proxyCooldownRemaining(proxies[e.proxyIdx].Addr) > 0))
+		expired := nowNano-e.lastUsed.Load() > ttlNano
+		if !needRebuild && !expired {
+			e.lastUsed.Store(nowNano)
+			stickyMu.RUnlock()
 			slog.Debug("sticky target reuse", "key", key, "baseIdx", e.baseIdx, "proxyIdx", e.proxyIdx)
 			return e
 		}
 	}
+	stickyMu.RUnlock()
+
+	// 慢路径：写锁 — 创建或重建条目，并做懒清理。
+	stickyMu.Lock()
+	defer stickyMu.Unlock()
+
+	// 双重检查：其他 goroutine 可能已在我们拿到写锁前完成了创建。
+	if e, ok := stickyEntries[key]; ok {
+		needRebuild := (domainSticky && e.baseIdx < 0) || (proxySticky && (e.proxyIdx < 0 || e.proxyIdx >= nProxy || proxyCooldownRemaining(proxies[e.proxyIdx].Addr) > 0))
+		if !needRebuild && nowNano-e.lastUsed.Load() <= ttlNano {
+			e.lastUsed.Store(nowNano)
+			return e
+		}
+		delete(stickyEntries, key)
+	}
+
+	// 懒清理：清过期条目，超出上限时清最旧的。
+	for k, e := range stickyEntries {
+		if nowNano-e.lastUsed.Load() > ttlNano {
+			delete(stickyEntries, k)
+		}
+	}
+	if len(stickyEntries) > stickyMaxEntries {
+		var oldestKey string
+		var oldestNano int64 = 1<<63 - 1
+		for k, e := range stickyEntries {
+			if n := e.lastUsed.Load(); oldestKey == "" || n < oldestNano {
+				oldestKey, oldestNano = k, n
+			}
+		}
+		delete(stickyEntries, oldestKey)
+	}
 
 	// 哈希 + 递增序号：同一 key 的连续绑定会落在不同目标。
-	// base 与 proxy 使用不同哈希位独立分布，避免组合取模导致的偏斜。
 	seq := atomic.AddUint32(&stickyRebindSeq, 1)
 	h := fnv32a(key) + seq
 
@@ -488,14 +597,23 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 		proxyIdx = availableProxyIndex(proxies, int(h%uint32(nProxy)))
 	}
 
-	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx, lastUsed: now}
+	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx}
+	entry.lastUsed.Store(nowNano)
 	if proxySticky {
-		entry.client = buildProxyClient(proxies[proxyIdx], true)
+		p := proxies[proxyIdx]
+		if isTemplateProxy(p) {
+			// 模板代理：凭证含 {{session-id}}，每次请求须按 ocScope 展开，
+			// 不同会话凭证不同，不能共用同一 Transport。entry.client 留 nil，
+			// 由 selectUpstreamTarget 调用方负责按 ocScope 展开后直接构建。
+			entry.client = nil
+		} else {
+			entry.client = getOrBuildProxyClient(p, true)
+		}
 	} else {
 		entry.client = httpClient
 	}
 	stickyEntries[key] = entry
-	slog.Debug("sticky target bind", "key", key, "baseIdx", baseIdx, "proxyIdx", proxyIdx)
+	slog.Debug("sticky target bind", "key", key, "baseIdx", baseIdx, "proxyIdx", proxyIdx, "template", proxyIdx >= 0 && isTemplateProxy(proxies[proxyIdx]))
 	return entry
 }
 
@@ -531,41 +649,28 @@ func getHTTPClient() *http.Client {
 		return httpClient
 	}
 
-	var proxy Socks5Proxy
-	var useRR bool
-
 	if activeSocks5 == socks5RR {
 		if len(socks5Proxies) == 0 {
 			return httpClient
 		}
 		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[availableProxyIndex(socks5Proxies, int(idx))]
-		useRR = true
-	} else {
-		if socks5Client != nil && socks5ClientAddr == activeSocks5 {
-			return socks5Client
-		}
-
-		var found bool
-		for i := range socks5Proxies {
-			if socks5Proxies[i].Addr == activeSocks5 {
-				proxy = socks5Proxies[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return httpClient
-		}
+		// 复用单例池：轮询只选代理，不重新建连接池。
+		return getOrBuildProxyClient(socks5Proxies[availableProxyIndex(socks5Proxies, int(idx))], true)
 	}
 
-	client := buildProxyClient(proxy, useRR)
-
-	if !useRR {
-		socks5Client = client
-		socks5ClientAddr = activeSocks5
+	// 单固定代理：优先查单例池；池中无则按 Addr 查找并缓存。
+	if socks5Client != nil && socks5ClientAddr == activeSocks5 {
+		return socks5Client
 	}
-	return client
+	for i := range socks5Proxies {
+		if socks5Proxies[i].Addr == activeSocks5 {
+			c := getOrBuildProxyClient(socks5Proxies[i], false)
+			socks5Client = c
+			socks5ClientAddr = activeSocks5
+			return c
+		}
+	}
+	return httpClient
 }
 
 // getHTTPClientForTier 按认证层级选择 HTTP 客户端。

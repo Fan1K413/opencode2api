@@ -10,6 +10,8 @@ import (
 // 保存并替换全局代理状态,结束后恢复。
 func withStickyProxyEnv(t *testing.T, proxies []Socks5Proxy, active string, sticky bool, paidDirect bool) {
 	t.Helper()
+	resetProxyClientPool()
+	t.Cleanup(resetProxyClientPool)
 	socks5Mu.Lock()
 	oldProxies := socks5Proxies
 	oldActive := activeSocks5

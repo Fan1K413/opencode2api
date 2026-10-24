@@ -146,3 +146,66 @@ func TestProxyPool_AllCoolingReturnsImmediately(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyPool_ClientReuseKeepsRoutingModesSeparate(t *testing.T) {
+	resetProxyClientPool()
+	t.Cleanup(resetProxyClientPool)
+	p := Socks5Proxy{Addr: "proxy:1080", Username: "one"}
+	pooled := getOrBuildProxyClient(p, true)
+	if getOrBuildProxyClient(p, true) != pooled {
+		t.Fatal("pool client was not reused")
+	}
+	fixed := getOrBuildProxyClient(p, false)
+	if fixed == pooled {
+		t.Fatal("fixed mode reused pool cooldown transport")
+	}
+	if _, ok := fixed.Transport.(*proxyPoolTransport); ok {
+		t.Fatal("fixed proxy unexpectedly applies pool cooldown")
+	}
+	p.Username = "two"
+	other := getOrBuildProxyClient(p, true)
+	if other == pooled {
+		t.Fatal("different credentials reused the same client")
+	}
+	resetProxyClientPool()
+	if getOrBuildProxyClient(p, true) == other {
+		t.Fatal("reset kept stale client")
+	}
+}
+
+func TestProxyPool_TemplateStillHonorsCooldown(t *testing.T) {
+	resetProxyCooldowns(t)
+	withStickyProxyEnv(t, []Socks5Proxy{{Addr: "template:1080", Username: "user-{{session-id}}"}}, socks5RR, true, false)
+	_, first := selectUpstreamTarget(UpstreamAuth{}, nil, nil, "scope-a")
+	_, second := selectUpstreamTarget(UpstreamAuth{}, nil, nil, "scope-b")
+	if first == second {
+		t.Fatal("template credentials reused a client across sessions")
+	}
+	if first.Transport.(*proxyPoolTransport).addr != "template:1080" {
+		t.Fatal("template lost cooldown identity")
+	}
+	proxyCooldowns.Lock()
+	proxyCooldowns.until["template:1080"] = time.Now().Add(time.Minute)
+	proxyCooldowns.Unlock()
+	req, _ := http.NewRequest("GET", "http://upstream.test", nil)
+	resp, err := second.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 429 {
+		t.Fatalf("status = %d, want local cooldown response", resp.StatusCode)
+	}
+}
+
+func TestProxyPool_ExpiredStickyEntryRebuilt(t *testing.T) {
+	resetProxyCooldowns(t)
+	proxies := []Socks5Proxy{{Addr: "a:1080"}, {Addr: "b:1080"}}
+	withStickyProxyEnv(t, proxies, socks5RR, true, false)
+	entry := lookupOrCreateSticky("expired", false, true, 1, 2, proxies, "")
+	entry.lastUsed.Store(time.Now().Add(-stickyEntryTTL - time.Second).UnixNano())
+	next := lookupOrCreateSticky("expired", false, true, 1, 2, proxies, "")
+	if next == entry {
+		t.Fatal("expired sticky entry reused on slow path")
+	}
+}
